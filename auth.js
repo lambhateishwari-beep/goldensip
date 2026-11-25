@@ -1,62 +1,55 @@
-// Owner login: the password lives ONLY in the ADMIN_PASSWORD environment variable
-// (set in Vercel). It is never written in code or sent to customers.
+// Owner login. Everything is checked on the server.
+// Vercel environment variables:
+//   ADMIN_PASSWORD  (required)  the owner's password
+//   ADMIN_EMAIL     (optional)  defaults to lambhateishwari@gmail.com
+//   ADMIN_PHONE     (optional)  defaults to 7559492970
+//   SESSION_SECRET  (optional)  any long random text
 const crypto = require('crypto');
+const { getCookie } = require('./http');
 
 const COOKIE = 'tgs_admin';
-const SESSION_SECONDS = 8 * 60 * 60; // owner stays logged in for 8 hours
+const MAX_AGE = 7 * 24 * 3600; // stay logged in for 7 days
+const env = (k, d = '') => process.env[k] || d;
 
-function sha256(s) { return crypto.createHash('sha256').update(String(s)).digest(); }
-function configured() { return !!process.env.ADMIN_PASSWORD; }
+const configured = () => !!env('ADMIN_PASSWORD');
+const secret = () =>
+  env('SESSION_SECRET') || crypto.createHash('sha256').update('tgs|' + env('ADMIN_PASSWORD')).digest('hex');
+const sign = (payload) => crypto.createHmac('sha256', secret()).update(payload).digest('base64url');
 
-function secret() {
-  return process.env.SESSION_SECRET ||
-    crypto.createHash('sha256').update('tgs-session:' + (process.env.ADMIN_PASSWORD || '')).digest('hex');
+function safeEq(a, b) {
+  const x = crypto.createHash('sha256').update(String(a)).digest();
+  const y = crypto.createHash('sha256').update(String(b)).digest();
+  return crypto.timingSafeEqual(x, y);
 }
-function hmac(payload) {
-  return crypto.createHmac('sha256', secret()).update(payload).digest('hex');
-}
 
-function passwordOk(input) {
-  if (!configured() || typeof input !== 'string' || input.length > 200) return false;
-  return crypto.timingSafeEqual(sha256(input), sha256(process.env.ADMIN_PASSWORD));
+// id = email OR phone number typed by the owner
+function checkLogin(id, password) {
+  if (!configured()) return false;
+  const raw = String(id || '').trim().toLowerCase();
+  const email = env('ADMIN_EMAIL', 'lambhateishwari@gmail.com').trim().toLowerCase();
+  const phone = env('ADMIN_PHONE', '7559492970').replace(/\D/g, '').slice(-10);
+  const digits = raw.replace(/\D/g, '').slice(-10);
+  const pwOk = safeEq(String(password || ''), env('ADMIN_PASSWORD'));
+  const emailOk = safeEq(raw, email);
+  const phoneOk = !raw.includes('@') && digits.length === 10 && safeEq(digits, phone);
+  return pwOk && (emailOk || phoneOk);
 }
 
 function makeToken() {
-  const exp = Math.floor(Date.now() / 1000) + SESSION_SECONDS;
-  const payload = exp + '.' + crypto.randomBytes(8).toString('hex');
-  return payload + '.' + hmac(payload);
+  const payload = Buffer.from(JSON.stringify({ exp: Date.now() + MAX_AGE * 1000 })).toString('base64url');
+  return payload + '.' + sign(payload);
 }
 
-function verifyToken(token) {
-  if (!configured() || typeof token !== 'string') return false;
-  const parts = token.split('.');
-  if (parts.length !== 3) return false;
-  const payload = parts[0] + '.' + parts[1];
-  const a = Buffer.from(hmac(payload));
-  const b = Buffer.from(parts[2]);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
-  return Number(parts[0]) > Math.floor(Date.now() / 1000);
+function isAdmin(req) {
+  if (!configured()) return false;
+  const [payload, sig] = getCookie(req, COOKIE).split('.');
+  if (!payload || !sig || !safeEq(sig, sign(payload))) return false;
+  try { return JSON.parse(Buffer.from(payload, 'base64url').toString()).exp > Date.now(); }
+  catch (e) { return false; }
 }
 
-function readCookie(req, name) {
-  const raw = req.headers.cookie || '';
-  for (const part of raw.split(';')) {
-    const i = part.indexOf('=');
-    if (i > 0 && part.slice(0, i).trim() === name) return decodeURIComponent(part.slice(i + 1).trim());
-  }
-  return '';
-}
+const secure = () => (process.env.VERCEL || process.env.NODE_ENV === 'production' ? '; Secure' : '');
+const sessionCookie = () => `${COOKIE}=${makeToken()}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${MAX_AGE}${secure()}`;
+const clearCookie = () => `${COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure()}`;
 
-function isAdmin(req) { return verifyToken(readCookie(req, COOKIE)); }
-
-function secureFlag(req) {
-  return (req.headers['x-forwarded-proto'] || '').split(',')[0] === 'https' ? '; Secure' : '';
-}
-function sessionCookie(req) {
-  return `${COOKIE}=${makeToken()}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${SESSION_SECONDS}${secureFlag(req)}`;
-}
-function clearCookie(req) {
-  return `${COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secureFlag(req)}`;
-}
-
-module.exports = { configured, passwordOk, isAdmin, sessionCookie, clearCookie };
+module.exports = { configured, checkLogin, isAdmin, sessionCookie, clearCookie };
